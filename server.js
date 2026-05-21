@@ -1,139 +1,64 @@
 import express from "express";
-import * as cheerio from "cheerio";
+import { LruTtlCache, TTL } from "./lib/cache.js";
+import { fetchWithTimeoutAndRetry } from "./lib/fetch.js";
+import { extractTocFromHtml, extractTocFromText, pickBestFormat } from "./lib/toc.js";
 
 const app = express();
 app.disable("x-powered-by");
 
 const GUTENDEX = "https://gutendex.com";
+const metadataCache = new LruTtlCache(500);
+const tocCache = new LruTtlCache(1000);
+const contentCache = new LruTtlCache(500);
 
-function pickBestFormat(formats, prefer = "html") {
-  const html = formats?.["text/html; charset=utf-8"] || formats?.["text/html"] || null;
-  const text = formats?.["text/plain; charset=utf-8"] || formats?.["text/plain"] || null;
-
-  if (prefer === "text") {
-    return {
-      url: text || html,
-      mime: text ? "text/plain" : html ? "text/html" : null,
-    };
-  }
-
-  return {
-    url: html || text,
-    mime: html ? "text/html" : text ? "text/plain" : null,
-  };
+function parseTotalBytes(contentRangeHeader) {
+  if (!contentRangeHeader) return null;
+  const match = String(contentRangeHeader).match(/bytes\s+\d+-\d+\/(\d+|\*)/i);
+  if (!match || match[1] === "*") return null;
+  return Number(match[1]);
 }
 
-function uniqByLabel(items) {
-  const seen = new Set();
-  const out = [];
-  for (const it of items) {
-    const key = String(it?.label ?? "").trim().toLowerCase();
-    if (!key) continue;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(it);
-  }
-  return out;
+async function getBookMetadata(id) {
+  const key = `book:${id}`;
+  const cached = metadataCache.get(key);
+  if (cached) return cached;
+
+  const response = await fetchWithTimeoutAndRetry(`${GUTENDEX}/books/${id}`, {
+    headers: { Accept: "application/json" },
+  });
+  if (!response.ok) throw new Error(response.status === 404 ? "Book not found on Gutendex" : `Metadata fetch failed (${response.status})`);
+
+  const book = await response.json();
+  metadataCache.set(key, book, TTL.metadata);
+  return book;
 }
 
-function extractTocFromText(txt, maxItems = 200) {
-  const lines = String(txt)
-    .split(/\r?\n/)
-    .map((l) => l.trim());
+function buildSearchSnippets(text, query, maxMatches, window) {
+  const qLower = query.toLowerCase();
+  const tLower = text.toLowerCase();
+  const matches = [];
+  let cursor = 0;
 
-  // Prefer: section after a "CONTENTS" header if present
-  const idx = lines.findIndex((l) => /^contents$/i.test(l) || /^table of contents$/i.test(l));
-  const preferred = idx !== -1 ? lines.slice(idx + 1, idx + 250).filter(Boolean) : [];
-
-  const toc = [];
-  const chapterRe = /^(chapter|chap\.?)[\s]+([0-9]+|[ivxlcdm]+)\b[:.\- ]*(.*)$/i;
-  const partRe = /^(part|book)[\s]+([0-9]+|[ivxlcdm]+)\b[:.\- ]*(.*)$/i;
-  const sectionRe = /^(preface|introduction|prologue|epilogue|appendix)\b[:.\- ]*(.*)$/i;
-
-  const source = preferred.length ? preferred : lines.slice(0, 1200);
-
-  for (const l of source) {
-    if (!l) continue;
-
-    let m;
-    if ((m = l.match(chapterRe))) {
-      toc.push({
-        label: `Chapter ${m[2]}${m[3] ? ` — ${m[3].trim()}` : ""}`,
-        level: 0,
-        anchor: null,
-        href: null,
-      });
-    } else if ((m = l.match(partRe))) {
-      const kind = m[1][0].toUpperCase() + m[1].slice(1).toLowerCase();
-      toc.push({
-        label: `${kind} ${m[2]}${m[3] ? ` — ${m[3].trim()}` : ""}`,
-        level: 0,
-        anchor: null,
-        href: null,
-      });
-    } else if ((m = l.match(sectionRe))) {
-      const kind = m[1][0].toUpperCase() + m[1].slice(1).toLowerCase();
-      toc.push({
-        label: `${kind}${m[2] ? ` — ${m[2].trim()}` : ""}`,
-        level: 0,
-        anchor: null,
-        href: null,
-      });
-    }
-
-    if (toc.length >= maxItems) break;
-  }
-
-  return uniqByLabel(toc).map((it, i) => ({ ...it, order: i }));
-}
-
-function extractTocFromHtml(html, maxItems = 200) {
-  const $ = cheerio.load(String(html));
-  const toc = [];
-
-  // 1) Try explicit TOC blocks (heading contains "Contents") then next list
-  const contentsHeadings = $("h1,h2,h3,h4,h5").filter((_, el) => /contents|table of contents/i.test($(el).text() || ""));
-
-  if (contentsHeadings.length) {
-    const h = contentsHeadings.first();
-    const list = h.nextAll("ul,ol").first();
-    if (list.length) {
-      list.find("a").each((_, a) => {
-        const label = ($(a).text() || "").trim();
-        const href = (($(a).attr("href") || "").trim()) || null;
-        if (!label) return;
-        toc.push({
-          label,
-          level: 0,
-          anchor: href && href.startsWith("#") ? href.slice(1) : null,
-          href,
-        });
-      });
-    }
-  }
-
-  // 2) Fallback: scan headings that look like chapters
-  if (!toc.length) {
-    const re = /^(chapter|chap\.?)[\s]+([0-9]+|[ivxlcdm]+)\b/i;
-    $("h1,h2,h3").each((_, el) => {
-      const t = (($(el).text() || "").trim());
-      if (!t) return;
-      if (!re.test(t)) return;
-      toc.push({
-        label: t,
-        level: 0,
-        anchor: ($(el).attr("id") || null),
-        href: null,
-      });
+  while (matches.length < maxMatches) {
+    const idx = tLower.indexOf(qLower, cursor);
+    if (idx < 0) break;
+    const snippetStart = Math.max(0, idx - window);
+    const snippetEnd = Math.min(text.length, idx + query.length + window);
+    matches.push({
+      offset: idx,
+      matchLength: query.length,
+      snippetStart,
+      snippetEnd,
+      snippet: text.slice(snippetStart, snippetEnd),
     });
+    cursor = idx + Math.max(1, query.length);
   }
 
-  return uniqByLabel(toc).slice(0, maxItems).map((it, i) => ({ ...it, order: i }));
+  return matches;
 }
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-// Proxy search (optional helper for GPT actions)
 app.get("/api/books", async (req, res) => {
   const search = (req.query.search ?? "").toString();
   const languages = (req.query.languages ?? "en").toString();
@@ -148,37 +73,62 @@ app.get("/api/books", async (req, res) => {
   if (sort) url.searchParams.set("sort", sort);
   if (page) url.searchParams.set("page", String(page));
 
-  const r = await fetch(url, { headers: { Accept: "application/json" } });
-  const j = await r.json().catch(() => null);
-  res.status(r.ok ? 200 : 502).json(j ?? { error: "Invalid JSON from upstream" });
+  try {
+    const r = await fetchWithTimeoutAndRetry(url, { headers: { Accept: "application/json" } });
+    const j = await r.json().catch(() => null);
+    return res.status(r.ok ? 200 : 502).json(j ?? { error: "Invalid JSON from upstream" });
+  } catch (e) {
+    return res.status(502).json({ error: e?.message ?? "Search proxy failed" });
+  }
 });
 
-// Get a slice of book content ("page" as chunk)
 app.get("/api/books/:id/content", async (req, res) => {
   const id = Number(req.params.id);
-  const prefer = (req.query.prefer ?? "text").toString(); // html|text
+  const prefer = (req.query.prefer ?? "text").toString();
   const offset = Math.max(0, Number(req.query.offset ?? 0) || 0);
   const limit = Math.min(Math.max(1, Number(req.query.limit ?? 6000) || 6000), 50000);
-
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
 
   try {
-    const metaRes = await fetch(`${GUTENDEX}/books/${id}`, { headers: { Accept: "application/json" } });
-    if (!metaRes.ok) return res.status(404).json({ error: "Book not found on Gutendex" });
-
-    const book = await metaRes.json();
+    const book = await getBookMetadata(id);
     const { url: sourceUrl, mime } = pickBestFormat(book?.formats || {}, prefer);
     if (!sourceUrl || !mime) return res.status(404).json({ error: "No readable format available" });
 
-    const textRes = await fetch(sourceUrl, { headers: { Accept: "*/*" } });
-    if (!textRes.ok) return res.status(502).json({ error: `Failed to fetch book content (${textRes.status})` });
+    const cacheKey = `content:${id}:${prefer}:${offset}:${limit}`;
+    if (offset === 0) {
+      const cached = contentCache.get(cacheKey);
+      if (cached) {
+        res.set("Cache-Control", "public, max-age=300");
+        return res.json(cached);
+      }
+    }
 
-    const body = await textRes.text();
-    const totalChars = body.length;
-    const content = body.slice(offset, offset + limit);
+    const rangeEnd = offset + limit - 1;
+    const rangeResponse = await fetchWithTimeoutAndRetry(sourceUrl, {
+      headers: { Accept: "*/*", Range: `bytes=${offset}-${rangeEnd}` },
+    });
 
-    res.set("Cache-Control", "public, max-age=300");
-    return res.json({
+    let content = "";
+    let totalChars = null;
+
+    if (rangeResponse.status === 206) {
+      content = await rangeResponse.text();
+      totalChars = parseTotalBytes(rangeResponse.headers.get("content-range"));
+    } else if (rangeResponse.status === 200) {
+      const fullBody = await rangeResponse.text();
+      content = fullBody.slice(offset, offset + limit);
+      totalChars = fullBody.length;
+    } else if (rangeResponse.status === 416) {
+      content = "";
+      totalChars = parseTotalBytes(rangeResponse.headers.get("content-range")) ?? 0;
+    } else {
+      return res.status(502).json({ error: `Failed to fetch book content (${rangeResponse.status})` });
+    }
+
+    const hasMore = totalChars == null ? content.length >= limit : offset + content.length < totalChars;
+    const nextOffset = hasMore ? offset + content.length : null;
+
+    const payload = {
       bookId: id,
       title: book?.title || `Book ${id}`,
       sourceFormat: mime === "text/html" ? "text/html" : "text/plain",
@@ -187,39 +137,44 @@ app.get("/api/books/:id/content", async (req, res) => {
       limit,
       totalChars,
       content,
-      hasMore: offset + limit < totalChars,
-      nextOffset: offset + limit < totalChars ? offset + limit : null,
-    });
+      hasMore,
+      nextOffset,
+    };
+
+    if (offset === 0) contentCache.set(cacheKey, payload, TTL.content);
+    res.set("Cache-Control", "public, max-age=300");
+    return res.json(payload);
   } catch (e) {
-    return res.status(502).json({ error: e?.message ?? "Content fetch failed" });
+    const message = e?.message ?? "Content fetch failed";
+    return res.status(/not found/i.test(message) ? 404 : 502).json({ error: message });
   }
 });
 
-// Extract TOC
 app.get("/api/books/:id/toc", async (req, res) => {
   const id = Number(req.params.id);
   const maxItems = Math.min(Number(req.query.maxItems ?? 200) || 200, 500);
-  const prefer = (req.query.prefer ?? "html").toString(); // html|text
-
+  const prefer = (req.query.prefer ?? "html").toString();
   if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
 
   try {
-    const metaRes = await fetch(`${GUTENDEX}/books/${id}`, { headers: { Accept: "application/json" } });
-    if (!metaRes.ok) return res.status(404).json({ error: "Book not found on Gutendex" });
+    const cacheKey = `toc:${id}:${prefer}:${maxItems}`;
+    const cached = tocCache.get(cacheKey);
+    if (cached) {
+      res.set("Cache-Control", "public, max-age=300");
+      return res.json(cached);
+    }
 
-    const book = await metaRes.json();
+    const book = await getBookMetadata(id);
     const { url: sourceUrl, mime } = pickBestFormat(book?.formats || {}, prefer);
     if (!sourceUrl || !mime) return res.status(404).json({ error: "No readable format available" });
 
-    const textRes = await fetch(sourceUrl, { headers: { Accept: "*/*" } });
+    const textRes = await fetchWithTimeoutAndRetry(sourceUrl, { headers: { Accept: "*/*" } });
     if (!textRes.ok) return res.status(502).json({ error: `Failed to fetch book content (${textRes.status})` });
-
     const body = await textRes.text();
 
     let toc = [];
     let method = "unknown";
     let sourceFormat = "unknown";
-
     if (mime === "text/html") {
       toc = extractTocFromHtml(body, maxItems);
       method = toc.length ? "html-toc-or-headings" : "html-no-toc-found";
@@ -230,17 +185,76 @@ app.get("/api/books/:id/toc", async (req, res) => {
       sourceFormat = "text/plain";
     }
 
-    res.set("Cache-Control", "public, max-age=300");
-    return res.json({
+    const payload = {
       bookId: id,
       title: book?.title || `Book ${id}`,
       sourceFormat,
       sourceUrl,
       method,
       toc,
+    };
+    tocCache.set(cacheKey, payload, TTL.toc);
+    res.set("Cache-Control", "public, max-age=300");
+    return res.json(payload);
+  } catch (e) {
+    const message = e?.message ?? "TOC extraction failed";
+    return res.status(/not found/i.test(message) ? 404 : 502).json({ error: message });
+  }
+});
+
+app.get("/api/books/:id/search", async (req, res) => {
+  const id = Number(req.params.id);
+  const q = (req.query.q ?? "").toString().trim();
+  const maxMatches = Math.min(Math.max(Number(req.query.maxMatches ?? 20) || 20, 1), 100);
+  const window = Math.min(Math.max(Number(req.query.window ?? 80) || 80, 20), 400);
+  const prefer = (req.query.prefer ?? "text").toString();
+
+  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
+  if (!q) return res.status(400).json({ error: "Missing q query parameter" });
+
+  try {
+    const book = await getBookMetadata(id);
+    const { url: sourceUrl, mime } = pickBestFormat(book?.formats || {}, prefer);
+    if (!sourceUrl || !mime) return res.status(404).json({ error: "No readable format available" });
+
+    const response = await fetchWithTimeoutAndRetry(sourceUrl, { headers: { Accept: "*/*" } });
+    if (!response.ok) return res.status(502).json({ error: `Failed to fetch book content (${response.status})` });
+
+    const MAX_SCAN_CHARS = 2_500_000;
+    let scanned = "";
+    const reader = response.body?.getReader();
+    const decoder = new TextDecoder();
+
+    if (!reader) {
+      scanned = (await response.text()).slice(0, MAX_SCAN_CHARS);
+    } else {
+      while (scanned.length < MAX_SCAN_CHARS) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        scanned += decoder.decode(value, { stream: true });
+        if (buildSearchSnippets(scanned, q, maxMatches, window).length >= maxMatches) break;
+      }
+      scanned += decoder.decode();
+      if (scanned.length > MAX_SCAN_CHARS) scanned = scanned.slice(0, MAX_SCAN_CHARS);
+    }
+
+    const matches = buildSearchSnippets(scanned, q, maxMatches, window);
+    return res.json({
+      bookId: id,
+      title: book?.title || `Book ${id}`,
+      sourceFormat: mime,
+      sourceUrl,
+      query: q,
+      maxMatches,
+      window,
+      scannedChars: scanned.length,
+      truncated: scanned.length >= MAX_SCAN_CHARS,
+      count: matches.length,
+      matches,
     });
   } catch (e) {
-    return res.status(502).json({ error: e?.message ?? "TOC extraction failed" });
+    const message = e?.message ?? "Search failed";
+    return res.status(/not found/i.test(message) ? 404 : 502).json({ error: message });
   }
 });
 
