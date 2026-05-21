@@ -153,6 +153,48 @@ app.get("/api/books", async (req, res) => {
   res.status(r.ok ? 200 : 502).json(j ?? { error: "Invalid JSON from upstream" });
 });
 
+// Get a slice of book content ("page" as chunk)
+app.get("/api/books/:id/content", async (req, res) => {
+  const id = Number(req.params.id);
+  const prefer = (req.query.prefer ?? "text").toString(); // html|text
+  const offset = Math.max(0, Number(req.query.offset ?? 0) || 0);
+  const limit = Math.min(Math.max(1, Number(req.query.limit ?? 6000) || 6000), 50000);
+
+  if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid id" });
+
+  try {
+    const metaRes = await fetch(`${GUTENDEX}/books/${id}`, { headers: { Accept: "application/json" } });
+    if (!metaRes.ok) return res.status(404).json({ error: "Book not found on Gutendex" });
+
+    const book = await metaRes.json();
+    const { url: sourceUrl, mime } = pickBestFormat(book?.formats || {}, prefer);
+    if (!sourceUrl || !mime) return res.status(404).json({ error: "No readable format available" });
+
+    const textRes = await fetch(sourceUrl, { headers: { Accept: "*/*" } });
+    if (!textRes.ok) return res.status(502).json({ error: `Failed to fetch book content (${textRes.status})` });
+
+    const body = await textRes.text();
+    const totalChars = body.length;
+    const content = body.slice(offset, offset + limit);
+
+    res.set("Cache-Control", "public, max-age=300");
+    return res.json({
+      bookId: id,
+      title: book?.title || `Book ${id}`,
+      sourceFormat: mime === "text/html" ? "text/html" : "text/plain",
+      sourceUrl,
+      offset,
+      limit,
+      totalChars,
+      content,
+      hasMore: offset + limit < totalChars,
+      nextOffset: offset + limit < totalChars ? offset + limit : null,
+    });
+  } catch (e) {
+    return res.status(502).json({ error: e?.message ?? "Content fetch failed" });
+  }
+});
+
 // Extract TOC
 app.get("/api/books/:id/toc", async (req, res) => {
   const id = Number(req.params.id);
