@@ -55,9 +55,9 @@ Response includes:
 ## Reliability and caching
 
 - All upstream fetches use timeout + retry:
-  - timeout: `8s`
-  - retries: `2`
-  - backoff: `200ms`, then `600ms`
+  - timeout: `15s` (default, configurable with `UPSTREAM_TIMEOUT_MS`)
+  - retries: `3` (default, configurable with `UPSTREAM_RETRIES`)
+  - backoff: `300ms`, `900ms`, then `1800ms`
 - In-memory LRU + TTL cache:
   - Gutendex metadata (`/books/:id`): `10 min`
   - TOC (`/api/books/:id/toc`): `24 h`
